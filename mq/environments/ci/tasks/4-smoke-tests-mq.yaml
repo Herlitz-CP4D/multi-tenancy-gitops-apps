@@ -1,0 +1,243 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: ibm-smoke-tests-mq
+  annotations:
+    description: Deploys the application to the CI environment for verification using the provided helm chart
+    app.openshift.io/description: Deploys the application to the CI environment for verification using the provided helm chart
+    app.openshift.io/vcs-uri: https://github.com/IBM/ibm-garage-tekton-tasks
+    app.openshift.io/vcs-ref: master
+  labels:
+    version: 0.0.0
+spec:
+  params:
+    - name: git-url
+    - name: git-revision
+      default: master
+    - name: source-dir
+      default: /source
+    - name: image-server
+      default: ""
+    - name: image-namespace
+      default: ""
+    - name: image-repository
+      default: ""
+    - name: image-tag
+      default: ""
+    - name: app-namespace
+      default: ""
+    - name: app-name
+      default: ""
+    - name: storage
+      default: ""
+    - name : security
+      default: ""
+    - name : ha
+      default: ""
+    - name: deploy-ingress-type
+      default: "route"
+    - name: tools-image
+      default: quay.io/ibmgaragecloud/ibmcloud-dev:v2.0.4
+    - name: yaml
+      default: "kustomize/base"
+  results:
+    - name: service-port
+    - name: resource-type
+  volumes:
+    - name: source
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - name: source
+        mountPath: $(params.source-dir)
+  steps:
+    - name: git-clone
+      image: quay.io/ibmgaragecloud/alpine-git
+      env:
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: password
+              optional: true
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: username
+              optional: true
+      script: |
+        set +x
+        if [[ -n "${GIT_USERNAME}" ]] && [[ -n "${GIT_PASSWORD}" ]]; then
+            git clone "$(echo $(params.git-url) | awk -F '://' '{print $1}')://${GIT_USERNAME}:${GIT_PASSWORD}@$(echo $(params.git-url) | awk -F '://' '{print $2}')" $(params.source-dir)
+        else
+            set -x
+            git clone $(params.git-url) $(params.source-dir)
+        fi
+        set -x
+        cd $(params.source-dir)
+        git checkout $(params.git-revision)
+    - name: deploy
+      image: $(params.tools-image)
+      workingDir: $(params.source-dir)
+      script: |
+          #!/usr/bin/env bash
+          set -ex
+          GIT_URL="$(params.git-url)"
+          GIT_REVISION="$(params.git-revision)"
+          APP_NAMESPACE="$(params.app-namespace)"
+          APP_NAME="$(params.app-name)"
+          IMAGE_SERVER="$(params.image-server)"
+          IMAGE_NAMESPACE="$(params.image-namespace)"
+          IMAGE_REPOSITORY="$(params.image-repository)"
+          IMAGE_URL="${IMAGE_SERVER}/${IMAGE_NAMESPACE}/${IMAGE_REPOSITORY}"
+          IMAGE_VERSION="$(params.image-tag)"
+
+          if $(params.ha); then
+            export YAML_ROOT="$(params.yaml)/native-ha-qmgr"
+          elif $(params.storage); then
+            export YAML_ROOT="$(params.yaml)/durable-qmgr"
+          else
+            export YAML_ROOT="$(params.yaml)/generic-qmgr"
+          fi
+
+          echo "YAML_ROOT: $YAML_ROOT"
+
+          if [[ -f "$YAML_ROOT/queuemanager.yaml" ]]; then
+            export YAML="$(params.yaml)/generic-qmgr/queuemanager.yaml"
+          elif [[ -f "$YAML_ROOT/deployment.yaml" ]]; then
+            export YAML="$YAML_ROOT/deployment.yaml"
+          elif [[ -f statefulset.yaml ]]; then
+            export YAML="$YAML_ROOT/statefulset.yaml"
+          else
+            echo "Error: No deployment file is detected"
+            exit 1
+          fi
+
+          echo "YAML: $YAML"
+          export YAML_NEW="./$YAML-new.yaml"
+          echo "YAML_NEW: $YAML_NEW"
+
+          PREFIX=""
+          if [[ -f "${YAML}" ]]; then
+            sed "/image/ s|replace|${IMAGE_URL}:${IMAGE_VERSION}|g" $YAML > $YAML_NEW
+            rm ${YAML}
+            mv ${YAML_NEW} ${YAML}
+          fi
+
+          INGRESS_TYPE="$(params.deploy-ingress-type)"
+          if [[ "${INGRESS_TYPE}" == "route" ]]; then
+            ROUTE_ENABLED="true"
+            INGRESS_ENABLED="false"
+          else
+            ROUTE_ENABLED="false"
+            INGRESS_ENABLED="true"
+          fi
+
+          kustomize build ./$YAML_ROOT/ > release.yaml
+
+          echo -e "Generated release yaml for: ${APP_NAMESPACE}/${APP_NAME}"
+          cat ./release.yaml
+
+          echo -e "Deploying into: ${APP_NAMESPACE}/${APP_NAME}"
+          kubectl apply -n ${APP_NAMESPACE} -f ./release.yaml --validate=false > results.out
+          cat results.out
+          echo "Waiting for rollout of ${APP_NAMESPACE}/${APP_NAME}"
+
+
+          cat results.out | \
+            grep -E "deployment|statefulset|integrationserver|queuemanager" | \
+            sed "s/deployment.apps/deployment/g" | \
+            sed "s/statefulset.apps/statefulset/g" | \
+            sed "s/configured//g" | \
+            sed "s/created//g" | \
+            sed "s/unchanged//g" | while read target; do
+            echo "Waiting for rollout of ${target} in ${APP_NAMESPACE}"
+            if [[ ${target} == *"integrationserver"* ]]; then
+              kubectl wait --timeout=-1s --for=condition=Ready ${target}
+            elif [[ ${target} == *"queuemanager"* ]]; then
+              until [[ "$(kubectl get ${target} -o 'jsonpath={.status.phase}')" = "Running" ]];
+              do
+              sleep 5
+              echo "Waiting for Queuemanager to be ready."
+              done
+            else
+              kubectl rollout status -n ${APP_NAMESPACE} ${target}
+              SERVICE_PORT=$(kubectl get svc "${APP_NAME}" -n "${APP_NAMESPACE}" -o jsonpath="{.spec.ports[?(@.name == 'http')].port}")
+              echo -n "${SERVICE_PORT}" | tee $(results.service-port.path)
+            fi
+            echo -n "${target}" | cut -f1 -d / | tee $(results.resource-type.path)
+            echo -n "${target}" | cut -f2 -d / | tee /source/resource-name.txt
+          done
+      securityContext:
+        privileged: true
+    - name: health-check
+      image: $(params.tools-image)
+      script: |
+          #!/usr/bin/env bash
+          set -x
+
+          APP_NAME="$(params.app-name)"
+
+          # RELEASE_NAME="${APP_NAME}"
+          RELEASE_NAME=$(cat /source/resource-name.txt)
+          echo "RELEASE_NAME: $RELEASE_NAME"
+
+          podname=$(kubectl get pods --selector=app.kubernetes.io/instance=$RELEASE_NAME -o custom-columns=POD:.metadata.name --no-headers | head -n 1)
+          echo "podname: $podname"
+
+          queue="QM1"
+          echo "queue name: $queue"
+
+          echo "Sleep before test to make sure QMGR is up"
+          sleep 20
+
+          echo "Print the queue details: ..."
+          echo ""
+          kubectl exec $podname -- /bin/bash -c "echo \"define qlocal($queue) replace\" | runmqsc "
+
+          echo "Print the queue details: ..."
+          echo ""
+          kubectl exec $podname -- /bin/bash -c "echo \"DISPLAY QL($queue) ALL\" | runmqsc" > checkQ.txt 2>&1
+          cat checkQ.txt
+
+          if grep -q "QUEUE($queue)" checkQ.txt; then
+            echo "Queue has been successfully created."
+          else
+            exit 1
+          fi
+
+          # put message on queue
+          kubectl exec $podname -- /bin/bash -c "echo \"hello-world\" | /opt/mqm/samp/bin/amqsput $queue" > putMessage.txt 2>&1
+          cat putMessage.txt
+          echo "----------"
+          fail="reason code"
+          if grep -q "$fail" putMessage.txt; then
+            exit 1
+          else
+            echo "Message has been successfully put the queue."
+          fi
+
+          # get message on queue
+          kubectl exec $podname  -c qmgr -- /opt/mqm/samp/bin/amqsget $queue > getMessage.txt 2>&1
+          cat getMessage.txt
+          if grep -q "hello-world" getMessage.txt; then
+              echo "Message has been found on the queue."
+          else
+              echo "Error: Message has not been retrieved from the queue."
+              exit 1
+          fi
+    - name: cleanup
+      image: $(params.tools-image)
+      workingDir: $(params.source-dir)
+      script: |
+          #!/usr/bin/env bash
+          set -ex
+
+          APP_NAMESPACE="$(params.app-namespace)"
+
+          kubectl delete -n ${APP_NAMESPACE} -f ./release.yaml
+
+          if [[ "$(params.storage)" == "true" ]]; then
+            kubectl delete --all pvc -n ${APP_NAMESPACE}
+          fi

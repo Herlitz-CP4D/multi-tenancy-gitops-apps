@@ -1,0 +1,10 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: es-starter-app
+spec:
+  port:
+    targetPort: 8080
+  to:
+    kind: Service
+    name: es-starter-app

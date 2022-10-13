@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    version: 10.5.0
+    name: es-starter-app
+  name: es-starter-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: es-starter-app
+      version: 10.5.0
+  template:
+    metadata:
+      labels:
+        version: 10.5.0
+        name: es-starter-app
+    spec:
+      containers:
+        - name: es-demo
+          image: quay.io/ibmcase/es-demo
+          imagePullPolicy: Always
+          env:
+          - name: JAVA_APP_JAR
+            value: /deployments/demo-all.jar
+          - name: JAVA_OPTIONS
+            value: '-Dproperties_path=/deployments/cfg/kafka.properties'
+          ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+          volumeMounts:
+            - name: all-in-one
+              mountPath: "/deployments/cfg"
+              readOnly: true
+      volumes:
+        - name: all-in-one
+          projected:
+            sources:
+            - secret:
+                name: starter-app-kafka-properties
+            # - secret:
+            #     name: truststore-cert

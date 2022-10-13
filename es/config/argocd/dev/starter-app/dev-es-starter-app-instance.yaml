@@ -1,0 +1,28 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dev-es-starter-app-instance
+  annotations:
+    argocd.argoproj.io/sync-wave: "310"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # The following is not needed anymore as the route has been specified without the host property
+  # ignoreDifferences:
+  # - group: route.openshift.io/v1
+  #   kind: route
+  #   name: es-starter-app
+  #   jsonPointers:
+  #   - /spec/host
+  destination:
+    namespace: dev
+    server: https://kubernetes.default.svc
+  project: applications
+  source:
+    path: es/environments/dev/starter-app/
+    repoURL: https://github.com/cloud-native-toolkit-demos/multi-tenancy-gitops-apps.git
+    targetRevision: master
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

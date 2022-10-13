@@ -1,0 +1,10 @@
+apiVersion: triggers.tekton.dev/v1alpha1
+kind: EventListener
+metadata:
+  name: mq-qm-post-stage
+spec:
+  serviceAccountName: pipeline
+  triggers:
+    - name: mq-qm-post-stage
+      template:
+        ref: mq-qm-post-stage

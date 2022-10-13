@@ -1,0 +1,4 @@
+# Select what you want to get installed
+resources:
+ - event-streams
+ - starter-app

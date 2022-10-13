@@ -1,0 +1,323 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: ibm-gitops-for-mq
+  annotations:
+    description: Generates MQ artifacts
+    app.openshift.io/description: Generates MQ artifacts
+    app.openshift.io/vcs-uri: https://github.com/IBM/ibm-garage-tekton-tasks
+    app.openshift.io/vcs-ref: master
+  labels:
+    version: 0.0.0
+spec:
+  params:
+    - name: git-url
+    - name: git-revision
+      default: master
+    - name: source-dir
+      default: /source
+    - name: image-server
+      default: ""
+    - name: image-namespace
+      default: ""
+    - name: image-repository
+      default: ""
+    - name: image-tag
+      default: ""
+    - name: app-name
+      default: ""
+    - name: app-path
+      default: ""
+    - name: environment
+      default: ""
+    - name : security
+      default: ""
+    - name: storage
+      default: ""
+    - name: ha
+      default: ""
+    - name: deploy-ingress-type
+      default: "route"
+    - name: tools-image
+      default: quay.io/ibmgaragecloud/ibmcloud-dev:v2.0.4
+    - name: src-environment
+      default: ""
+    - name: dest-environment
+      default: ""
+    - name: subdir
+      default: ""
+    - name: parentdir
+      default: ""
+    - name: git-pr
+      default: "false"
+    - name: yaml
+      default: "kustomize/base"
+  results:
+    - name: service-port
+    - name: resource-type
+  volumes:
+    - name: source
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - name: source
+        mountPath: $(params.source-dir)
+  steps:
+    - name: git-clone
+      image: quay.io/ibmgaragecloud/alpine-git
+      env:
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: password
+              optional: true
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: username
+              optional: true
+      script: |
+        set +x
+        if [[ -n "${GIT_USERNAME}" ]] && [[ -n "${GIT_PASSWORD}" ]]; then
+            git clone "$(echo $(params.git-url) | awk -F '://' '{print $1}')://${GIT_USERNAME}:${GIT_PASSWORD}@$(echo $(params.git-url) | awk -F '://' '{print $2}')" $(params.source-dir)
+        else
+            set -x
+            git clone $(params.git-url) $(params.source-dir)
+        fi
+        set -x
+        cd $(params.source-dir)
+        git checkout $(params.git-revision)
+    - name: replace-image
+      image: $(params.tools-image)
+      workingDir: $(params.source-dir)
+      env:
+        - name: TLS_SECRET_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: ibmcloud-config
+              key: TLS_SECRET_NAME
+              optional: true
+        - name: INGRESS_SUBDOMAIN
+          valueFrom:
+            configMapKeyRef:
+              name: ibmcloud-config
+              key: INGRESS_SUBDOMAIN
+              optional: true
+      script: |
+          #!/usr/bin/env bash
+          set -ex
+          GIT_URL="$(params.git-url)"
+          GIT_REVISION="$(params.git-revision)"
+          APP_NAME="$(params.app-name)"
+          IMAGE_SERVER="$(params.image-server)"
+          IMAGE_NAMESPACE="$(params.image-namespace)"
+          IMAGE_REPOSITORY="$(params.image-repository)"
+          IMAGE_URL="${IMAGE_SERVER}/${IMAGE_NAMESPACE}/${IMAGE_REPOSITORY}"
+          IMAGE_VERSION="$(params.image-tag)"
+
+          if [[ $APP_NAME == *"qm"* ]] ; then
+            if [[ "$(params.ha)" == "true" ]] ; then
+              export YAML_ROOT="$(params.yaml)/native-ha-qmgr"
+            elif [[ "$(params.storage)" == "true" ]]; then
+              export YAML_ROOT="$(params.yaml)/durable-qmgr"
+            else
+              export YAML_ROOT="$(params.yaml)/generic-qmgr"
+            fi
+          else
+            export YAML_ROOT="$(params.yaml)"
+          fi
+
+          echo "YAML_ROOT: $YAML_ROOT"
+
+          if [[ -f "$YAML_ROOT/queuemanager.yaml" ]]; then
+            export YAML="$(params.yaml)/generic-qmgr/queuemanager.yaml"
+          elif [[ -f "$YAML_ROOT/deployment.yaml" ]]; then
+            export YAML="$YAML_ROOT/deployment.yaml"
+          elif [[ -f statefulset.yaml ]]; then
+            export YAML="$YAML_ROOT/statefulset.yaml"
+          else
+            echo "Error: No deployment file is detected"
+            exit 1
+          fi
+
+          echo "YAML: $YAML"
+          export YAML_NEW="./$YAML-new.yaml"
+          echo "YAML_NEW: $YAML_NEW"
+
+          PREFIX=""
+          if [[ -f "${YAML}" ]]; then
+            sed "/image/ s|replace|${IMAGE_URL}:${IMAGE_VERSION}|g" $YAML > $YAML_NEW
+            rm ${YAML}
+            mv ${YAML_NEW} ${YAML}
+          fi
+
+          kustomize build ./$YAML_ROOT/ > release.yaml
+
+          echo -e "Generated release yaml for: ${APP_NAME}"
+          cat ./release.yaml
+
+          awk '
+          /apiVersion:/{
+            close(file)
+            file="queuemanager.yaml"
+          }
+          file!="" && !/^--/{
+            print > (file)
+          }
+          ' release.yaml
+
+          cat ./queuemanager.yaml
+      securityContext:
+        privileged: true
+    - name: gitops
+      image: $(params.tools-image)
+      workingDir: $(params.source-dir)
+      env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: HOME
+          value: /home/devops
+        - name: GIT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: username
+              optional: true
+        - name: GIT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: git-credentials
+              key: password
+              optional: true
+        - name: GIT_PARENT_DIR
+          valueFrom:
+            configMapKeyRef:
+              name: gitops-repo
+              key: parentdir
+              optional: true
+        - name: GIT_PROTOCOL
+          valueFrom:
+            configMapKeyRef:
+              name: gitops-repo
+              key: protocol
+              optional: true
+        - name: GIT_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: gitops-repo
+              key: host
+              optional: true
+        - name: GIT_ORG
+          valueFrom:
+            configMapKeyRef:
+              name: gitops-repo
+              key: org
+              optional: true
+        - name: GIT_REPO
+          valueFrom:
+            configMapKeyRef:
+              name: gitops-repo
+              key: repo
+              optional: true
+        - name: GIT_BRANCH
+          valueFrom:
+            configMapKeyRef:
+              name: gitops-repo
+              key: branch
+              optional: true
+      script: |
+          #!/usr/bin/env bash
+          set -ex
+          APP_NAME="$(params.app-name)"
+          SUBDIR="$(params.subdir)"
+          if [[ -z "${SUBDIR}" ]]; then
+            SUBDIR="${APP_NAME}"
+          fi
+          PROTOCOL="${GIT_PROTOCOL}"
+          if [[ -z "${PROTOCOL}" ]]; then
+            PROTOCOL="https"
+          fi
+          if [[ -z "${GIT_HOST}" ]] || [[ -z "${GIT_ORG}" ]] || [[ -z "${GIT_REPO}" ]]; then
+              echo "GitOps repo has not been configured with confimap gitops-repo. Skipping trigger step"
+              exit 0
+          fi
+          set +x
+          if [[ -n "${GIT_USERNAME}" ]]; then
+            GIT_AUTH_USER="${GIT_USERNAME}"
+            GIT_AUTH_PWD="${GIT_PASSWORD}"
+          else
+            echo "Credentials for GitOps repo not set in secret gitops-cd-secret or git-credentials"
+            exit 1
+          fi
+          set -x
+          BRANCH_CMD=""
+          if [[ -n "${GIT_BRANCH}" ]]; then
+            BRANCH_CMD="-b ${GIT_BRANCH}"
+          fi
+          git config --global user.email "gitops@cloudnativetoolkit.dev"
+          git config --global user.name "Cloud Native Toolkit Pipeline"
+          echo "git clone ${BRANCH_CMD} ${PROTOCOL}://${GIT_AUTH_USER}:xxxx@${GIT_HOST}/${GIT_ORG}/${GIT_REPO}"
+          set +x
+          GIT_URL="${PROTOCOL}://${GIT_AUTH_USER}:${GIT_AUTH_PWD}@${GIT_HOST}/${GIT_ORG}/${GIT_REPO}"
+          git clone ${BRANCH_CMD} ${GIT_URL} gitops_cd
+          set -x
+          cd gitops_cd
+          if [[ $APP_NAME == *"qm"* ]]; then
+            if [[ "$(params.ha)" == "true" ]] ; then
+              export SOURCE_DIR="../$(params.yaml)/native-ha-qmgr"
+            elif [[ "$(params.storage)" == "true" ]]; then
+              export SOURCE_DIR="../$(params.yaml)/durable-qmgr"
+            else
+              export SOURCE_DIR="../$(params.yaml)/generic-qmgr"
+            fi
+          else
+            export SOURCE_DIR="../$(params.yaml)"
+          fi
+          if [[ -f "$(params.source-dir)/queuemanager.yaml" ]]; then
+            cp -r $(params.source-dir)/queuemanager.yaml $(params.app-path)/$(params.environment)/${SUBDIR}/queuemanager
+          elif [[ -f "$SOURCE_DIR/deployment.yaml" ]]; then
+            cp -r "$SOURCE_DIR"/deployment.yaml $(params.app-path)/$(params.environment)/${SUBDIR}/deployment
+          elif [[ -f statefulset.yaml ]]; then
+            cp -r "$SOURCE_DIR"/statefulset.yaml $(params.app-path)/$(params.environment)/${SUBDIR}/deployment
+          else
+            echo "No change in deployment file"
+          fi
+
+          if ls $SOURCE_DIR/*.mqsc &> /dev/null; then
+            cp -r "$SOURCE_DIR"/*.mqsc $(params.app-path)/$(params.environment)/"${SUBDIR}"/configmap
+          fi
+
+          if ls $SOURCE_DIR/*.ini &> /dev/null; then
+            cp -r "$SOURCE_DIR"/*.ini $(params.app-path)/$(params.environment)/"${SUBDIR}"/configmap
+          fi
+
+          if ls $SOURCE_DIR/configmap*.yaml &> /dev/null; then
+            cp -r "$SOURCE_DIR"/configmap*.yaml $(params.app-path)/$(params.environment)/"${SUBDIR}"/configmap
+          fi
+
+          if ls $SOURCE_DIR/*secret*.yaml &> /dev/null; then
+            cp -r "$SOURCE_DIR"/*secret*.yaml $(params.app-path)/$(params.environment)/"${SUBDIR}"/secrets
+          fi
+
+          APP_VERSION="$(git rev-parse HEAD | cut -c 1-8)"
+          if [[ $(git status -s | wc -l) -eq 0 ]]; then
+            echo "No changes"
+            exit 0
+          elif [[ "$(params.git-pr)" = "false" ]]; then
+            git add .
+            git commit -m "Updates ${APP_NAME} to ${VERSION}"
+            git push -v
+          else
+            git checkout -b cntk-ci-pipeline-${APP_NAME}-${APP_VERSION}
+            # push changes to git
+            git status
+            git add "${SUBDIR_DEST}/"
+            git commit -m "Cloudnative toolkit pipeline updates ${APP_NAME}" --no-edit --signoff
+            git push origin cntk-ci-pipeline-${APP_NAME}-${APP_VERSION}
+            GIT_PUSH_URL="${PROTOCOL}://api.github.com/repos/${GIT_ORG}/${GIT_REPO}/pulls"
+            curl -u ${GIT_AUTH_USER}:${GIT_AUTH_PWD} -d '{"title":"PR to promote to '$(params.dest-environment)' for '$(params.app-name)'","base":"'${GIT_BRANCH}'", "head":"'${GIT_ORG}':cntk-ci-pipeline-'${APP_NAME}'-'${APP_VERSION}'"}' ${GIT_PUSH_URL}
+          fi
